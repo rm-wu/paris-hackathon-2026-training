@@ -1,5 +1,5 @@
 """
-v5 model — 110M + fused CE + value embeddings + x0 residual + per-layer lambdas.
+v6 model — 110M + ReLU² + U-Net skips + zero-init + value embeddings + x0 residual + per-layer lambdas
 
 CONTRACT
 --------------------
@@ -58,7 +58,6 @@ class CausalSelfAttention(nn.Module):
         cos, sin = precompute_rope(seq_len, self.head_dim)
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
-        # Value Embeddings (ResFormer): learned per-position bias on values
         self.val_embed = nn.Parameter(torch.zeros(seq_len, n_embd))
 
     def forward(self, x):
@@ -79,18 +78,18 @@ class CausalSelfAttention(nn.Module):
         return self.c_proj(y)
 
 
-class SwiGLU(nn.Module):
+class SquaredReLU(nn.Module):
+    """ReLU²: relu(x)² — simpler than SwiGLU (2 matmuls vs 3), same param count at 4x width."""
     def __init__(self, n_embd, dropout):
         super().__init__()
-        hidden = int(2 * (4 * n_embd) / 3)
-        hidden = ((hidden + 63) // 64) * 64
-        self.w_gate = nn.Linear(n_embd, hidden, bias=False)
+        hidden = 4 * n_embd
         self.w_up   = nn.Linear(n_embd, hidden, bias=False)
         self.w_down = nn.Linear(hidden, n_embd, bias=False)
         self.drop   = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.drop(self.w_down(F.silu(self.w_gate(x)) * self.w_up(x)))
+        h = F.relu(self.w_up(x))
+        return self.drop(self.w_down(h * h))
 
 
 class Block(nn.Module):
@@ -99,11 +98,9 @@ class Block(nn.Module):
         self.ln1  = RMSNorm(n_embd)
         self.attn = CausalSelfAttention(n_embd, n_head, seq_len, dropout)
         self.ln2  = RMSNorm(n_embd)
-        self.mlp  = SwiGLU(n_embd, dropout)
-        # Per-layer residual scaling (init=1 = standard residual)
+        self.mlp  = SquaredReLU(n_embd, dropout)
         self.lambda_attn = nn.Parameter(torch.ones(n_embd))
         self.lambda_mlp  = nn.Parameter(torch.ones(n_embd))
-        # x0 residual: skip from initial embedding (init=0 = inactive, learns to activate)
         self.lambda_x0 = nn.Parameter(torch.zeros(1))
 
     def forward(self, x, x0):
@@ -117,6 +114,7 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, seq_len, n_layer, n_head, n_embd, dropout=0.0):
         super().__init__()
         self.seq_len = seq_len
+        self.n_layer = n_layer
         self.transformer = nn.ModuleDict(dict(
             wte  = nn.Embedding(vocab_size, n_embd),
             h    = nn.ModuleList([Block(n_embd, n_head, seq_len, dropout)
@@ -126,10 +124,18 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
+        # U-Net skip connections: layer i <-> layer (n-1-i)
+        # Learned scalars (init=0) so they activate only if useful
+        half = n_layer // 2
+        self.skip_weights = nn.ParameterList(
+            [nn.Parameter(torch.zeros(1)) for _ in range(half)]
+        )
+
         self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight") or pn.endswith("w_down.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
+        # Zero-init output projections (muP-like): model starts as near-identity
+        for block in self.transformer.h:
+            nn.init.zeros_(block.attn.c_proj.weight)
+            nn.init.zeros_(block.mlp.w_down.weight)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -142,8 +148,20 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        for block in self.transformer.h:
+
+        n = self.n_layer
+        half = n // 2
+        saved = {}
+
+        for i, block in enumerate(self.transformer.h):
+            # U-Net: inject skip from symmetric first-half layer
+            mirror = n - 1 - i
+            if i >= half and mirror in saved:
+                x = x + self.skip_weights[mirror] * saved[mirror]
             x = block(x, x0)
+            if i < half:
+                saved[i] = x
+
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         logits = 30.0 * torch.tanh(logits / 30.0)

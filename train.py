@@ -1,5 +1,5 @@
 """
-v5 training — optimized throughput + val eval + WSD for Muon
+v6 training — ReLU² + U-Net skips + zero-init + throughput opts + val eval
 """
 
 import gc
@@ -23,7 +23,7 @@ from model import get_model
 
 
 # ---------------------------------------------------------------------------
-# Muon optimizer — 3 Newton-Schulz iters (faster, ~same quality as 5)
+# Muon optimizer — 3 Newton-Schulz iters
 # ---------------------------------------------------------------------------
 
 class Muon(torch.optim.Optimizer):
@@ -107,9 +107,6 @@ class Config:
 # ---------------------------------------------------------------------------
 
 class BinDataset:
-    """Memory-maps *.bin files. Last shard reserved for validation.
-    Supports async prefetch: call prefetch() to load next batch on CPU thread."""
-
     def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16"):
         paths = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
         if not paths:
@@ -162,7 +159,6 @@ class BinDataset:
         return x.to(device), y.to(device)
 
     def prefetch(self, batch_size: int):
-        """Start loading next train batch on a CPU thread."""
         def _load():
             self._prefetch_result = self._sample_batch_cpu(
                 self.train_shards, self.train_weights, batch_size)
@@ -343,7 +339,6 @@ def main():
     for opt in optimizers:
         opt.zero_grad()
 
-    # Kick off first prefetch
     dataset.prefetch(cfg.batch_size)
 
     while step < cfg.max_steps:
@@ -360,7 +355,6 @@ def main():
 
         step_start = time.time()
 
-        # Update LR for both optimizers (WSD schedule)
         adam_lr = get_lr(step, cfg)
         muon_lr = get_muon_lr(step, cfg)
         for pg in optimizer_adam.param_groups:
@@ -368,11 +362,9 @@ def main():
         for pg in optimizer_muon.param_groups:
             pg["lr"] = muon_lr
 
-        # Gradient accumulation with prefetch
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
             x, y = dataset.get_batch(cfg.batch_size, device)
-            # Prefetch next batch while GPU works
             if micro_step < cfg.grad_accum_steps - 1:
                 dataset.prefetch(cfg.batch_size)
 
@@ -393,7 +385,6 @@ def main():
         step += 1
         loss_history.append(accumulated_loss)
 
-        # Prefetch for next step's first micro-batch
         dataset.prefetch(cfg.batch_size)
 
         if master and step % 10 == 0:
@@ -406,7 +397,6 @@ def main():
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        # Validation eval — all processes must participate (DDP sync)
         if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:

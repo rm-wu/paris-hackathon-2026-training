@@ -1,13 +1,13 @@
-# Edouard's branch — v5 (val_loss 4.09 on 2 GPUs)
+# Edouard's branch — v6 (val_loss 4.01 on 2 GPUs)
 
-Best result so far: **val_loss 4.0939** in 10 min on 2x B300 GPUs (node 2, devices 6-7).
+Best result so far: **val_loss 4.0127** in 9.1 min on 2x B300 GPUs (node 2, devices 6-7).
 
 ## What changed vs baseline
 
-### Architecture (`model.py` — 119.6M params)
+### Architecture (`model.py` — ~119M params)
 | Technique | What it does |
 |-----------|-------------|
-| **SwiGLU** | LLaMA-style MLP, better loss/FLOP than GELU |
+| **ReLU²** | Squared ReLU MLP — 2 matmuls vs 3 (SwiGLU), same params, faster steps |
 | **RMSNorm** | Faster than LayerNorm (no mean computation) |
 | **RoPE** | Rotary Position Embeddings, replaces learned positional embeddings |
 | **QK Norm** | `rms_norm` on Q and K before attention — stabilizes gradients |
@@ -16,6 +16,8 @@ Best result so far: **val_loss 4.0939** in 10 min on 2x B300 GPUs (node 2, devic
 | **Value Embeddings** | Learned per-position bias on V in attention (ResFormer) |
 | **x0 Residual** | Skip from initial embedding to every block (learnable, init=0) |
 | **Per-layer Lambdas** | Learnable scaling for attn/mlp residuals per layer |
+| **U-Net Skip Connections** | Symmetric skip connections (layer 0→11, 1→10, ...) with learned scalars |
+| **Zero-init output projections** | c_proj and w_down init to 0 (muP-like, model starts as near-identity) |
 | **Weight tying** | `wte.weight = lm_head.weight` |
 
 ### Training (`train.py`)
@@ -37,7 +39,8 @@ Best result so far: **val_loss 4.0939** in 10 min on 2x B300 GPUs (node 2, devic
 | v2 (quick wins) | ~4.07 (train) | 1872 | ~250 | + QK Norm, logit cap, WSD, gc.disable |
 | v3 (big model) | ~4.28 (train) | 1177 | ~450 | 253M params — too few steps, regression |
 | v4s (+ val eval) | 4.1689 (val) | 1669 | ~315 | 110M + val eval + WSD max_steps fix |
-| **v5 (this)** | **4.0939 (val)** | **1964** | **~237** | + val_embed, x0, lambdas, throughput opts |
+| v5 (throughput) | 4.0939 (val) | 1964 | ~237 | + val_embed, x0, lambdas, throughput opts |
+| **v6 (this)** | **4.0127 (val)** | **2000** | **~220** | + ReLU², U-Net skips, zero-init |
 
 ## How to run
 
@@ -55,7 +58,7 @@ torchrun --nproc_per_node=32 train.py \
     --time_limit_min 10
 ```
 
-## Next up (v6)
-- ReLU² MLP (2 matmuls vs 3, faster steps)
-- U-Net skip connections (layer 0→11, 1→10, ..., learned scalars)
-- Zero-init output projections (muP-like, faster convergence)
+## Next up (v7)
+- Increase max_steps from 2000 to 2500 (v6 finished in 9.1 min, 0.9 min wasted)
+- Explore FP8 training for 2x throughput on B300
+- Scale to 32 GPUs for final submission
