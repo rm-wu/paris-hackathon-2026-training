@@ -3,8 +3,6 @@ Starter training script for the gpu-mode Paris hackathon training track
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
 import time
 import glob
 import math
@@ -14,12 +12,9 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
-torch.set_float32_matmul_precision('high')
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
-
-from torchao.float8 import Float8LinearConfig, convert_to_float8_training
 
 from model import get_model
 
@@ -37,16 +32,16 @@ class Config:
 
     # Model (passed through to get_model — add arch-specific keys in model.py)
     vocab_size: int   = 32768
-    n_layer:    int   = 16
-    n_head:     int   = 16
-    n_embd:     int   = 1024
+    n_layer:    int   = 12
+    n_head:     int   = 12
+    n_embd:     int   = 768
     dropout:    float = 0.0
 
     # Training
-    batch_size:       int   = 64
+    batch_size:       int   = 8
     grad_accum_steps: int   = 4
-    max_lr:           float = 3e-3
-    min_lr:           float = 3e-4
+    max_lr:           float = 6e-4
+    min_lr:           float = 6e-5
     warmup_steps:     int   = 100
     max_steps:        int   = 10_000
     weight_decay:     float = 0.1
@@ -122,13 +117,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir",          default="data")
     parser.add_argument("--checkpoint_path",   default="checkpoint.pt")
-    parser.add_argument("--seq_len",           type=int,   default=4096)
+    parser.add_argument("--seq_len",           type=int,   default=1024)
     parser.add_argument("--vocab_size",        type=int,   default=32768)
-    parser.add_argument("--n_layer",           type=int,   default=16)
-    parser.add_argument("--n_head",            type=int,   default=16)
-    parser.add_argument("--n_embd",            type=int,   default=1024)
-    parser.add_argument("--batch_size",        type=int,   default=64)
-    parser.add_argument("--grad_accum_steps",  type=int,   default=1)
+    parser.add_argument("--n_layer",           type=int,   default=12)
+    parser.add_argument("--n_head",            type=int,   default=12)
+    parser.add_argument("--n_embd",            type=int,   default=768)
+    parser.add_argument("--batch_size",        type=int,   default=8)
+    parser.add_argument("--grad_accum_steps",  type=int,   default=4)
     parser.add_argument("--max_steps",         type=int,   default=10_000)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     args = parser.parse_args()
@@ -169,9 +164,6 @@ def main():
     if master:
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters")
-
-    convert_to_float8_training(model, config=Float8LinearConfig())
-    model = torch.compile(model, fullgraph=True, dynamic=False)
 
     if ddp:
         model = DDP(model, device_ids=[local_rank])

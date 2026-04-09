@@ -1,10 +1,5 @@
 """
-Key changes from baseline:
-- RMSNorm instead of LayerNorm 
-- SwiGLU MLP instead of GELU
-- QK-norm for training stability at high LR
-- Vocab padded to multiple of 128 for GPU efficiency
-- No dropout (wasteful at this scale/time budget)
+Starter reference model definition.
 
 CONTRACT
 --------------------
@@ -25,76 +20,72 @@ import torch.nn.functional as F
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, seq_len, dropout):
         super().__init__()
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.n_embd = n_embd
-        self.head_dim = n_embd // n_head
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.c_attn  = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj  = nn.Linear(n_embd, n_embd,     bias=False)
+        self.dropout = dropout
 
     def forward(self, x):
         B, T, C = x.shape
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        # QK-norm for stable training at high LR (from modded-nanogpt)
-        q = F.rms_norm(q, (self.head_dim,))
-        k = F.rms_norm(k, (self.head_dim,))
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        hd = C // self.n_head
+        q = q.view(B, T, self.n_head, hd).transpose(1, 2)
+        k = k.view(B, T, self.n_head, hd).transpose(1, 2)
+        v = v.view(B, T, self.n_head, hd).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                           dropout_p=self.dropout if self.training else 0.0)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.c_proj(y)
 
 
-class SwiGLUMLP(nn.Module):
-    """SwiGLU MLP — same param count as 4x GELU MLP but better quality."""
-    def __init__(self, n_embd):
+class MLP(nn.Module):
+    def __init__(self, n_embd, dropout):
         super().__init__()
-        hidden = int(8 / 3 * n_embd)
-        hidden = ((hidden + 255) // 256) * 256  # round up for GPU efficiency
-        self.w1 = nn.Linear(n_embd, hidden, bias=False)  # gate
-        self.w2 = nn.Linear(n_embd, hidden, bias=False)  # up
-        self.w3 = nn.Linear(hidden, n_embd, bias=False)  # down
+        self.fc   = nn.Linear(n_embd, 4 * n_embd, bias=False)
+        self.proj = nn.Linear(4 * n_embd, n_embd, bias=False)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+        return self.drop(self.proj(F.gelu(self.fc(x))))
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, seq_len, dropout):
         super().__init__()
-        self.rms1 = nn.RMSNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head)
-        self.rms2 = nn.RMSNorm(n_embd)
-        self.mlp = SwiGLUMLP(n_embd)
+        self.ln1  = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, seq_len, dropout)
+        self.ln2  = nn.LayerNorm(n_embd)
+        self.mlp  = MLP(n_embd, dropout)
 
     def forward(self, x):
-        x = x + self.attn(self.rms1(x))
-        x = x + self.mlp(self.rms2(x))
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, seq_len, n_layer, n_head, n_embd):
+    def __init__(self, vocab_size, seq_len, n_layer, n_head, n_embd, dropout=0.0):
         super().__init__()
         self.seq_len = seq_len
-        self.padded_vocab = ((vocab_size + 127) // 128) * 128
         self.transformer = nn.ModuleDict(dict(
-            wte=nn.Embedding(self.padded_vocab, n_embd),
-            wpe=nn.Embedding(seq_len, n_embd),
-            h=nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)]),
+            wte  = nn.Embedding(vocab_size, n_embd),
+            wpe  = nn.Embedding(seq_len,    n_embd),
+            drop = nn.Dropout(dropout),
+            h    = nn.ModuleList([Block(n_embd, n_head, seq_len, dropout)
+                                  for _ in range(n_layer)]),
+            ln_f = nn.LayerNorm(n_embd),
         ))
-        self.rms_f = nn.RMSNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, self.padded_vocab, bias=False)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # weight tying
 
         self.apply(self._init_weights)
-        # Scale residual projections by 1/sqrt(2*n_layer)
-        for block in self.transformer.h:
-            nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
-            nn.init.normal_(block.mlp.w3.weight, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
+        for pn, p in self.named_parameters():
+            if pn.endswith("c_proj.weight") or pn.endswith("proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * n_layer))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -105,26 +96,35 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
-        x = self.transformer.wte(idx) + self.transformer.wpe(pos)
+        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
         for block in self.transformer.h:
             x = block(x)
-        x = self.rms_f(x)
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    def num_params(self):
+        return sum(p.numel() for p in self.parameters())
+
 
 # ---------------------------------------------------------------------------
-# Competition interface
+# Competition interface — participants must implement this
 # ---------------------------------------------------------------------------
 
 def get_model(config: dict) -> nn.Module:
+    """
+    Instantiate and return the model from a config dict.
+    Called by both train.py (before training) and eval.py (to load a checkpoint).
+    """
     return GPT(
-        vocab_size=config.get("vocab_size", 32768),
-        seq_len=config.get("seq_len", 1024),
-        n_layer=config.get("n_layer", 12),
-        n_head=config.get("n_head", 12),
-        n_embd=config.get("n_embd", 768),
+        vocab_size = config.get("vocab_size", 32768),
+        seq_len    = config.get("seq_len",    1024),
+        n_layer    = config.get("n_layer",    12),
+        n_head     = config.get("n_head",     12),
+        n_embd     = config.get("n_embd",     768),
+        dropout    = config.get("dropout",    0.0),
     )
+
