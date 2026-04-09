@@ -91,7 +91,7 @@ class Config:
     muon_max_lr:      float = 0.02
     muon_min_lr:      float = 0.002
     warmup_steps:     int   = 100
-    max_steps:        int   = 2_000
+    max_steps:        int   = 2_500
     weight_decay:     float = 0.1
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
@@ -240,7 +240,7 @@ def main():
     parser.add_argument("--n_embd",            type=int,   default=768)
     parser.add_argument("--batch_size",        type=int,   default=32)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
-    parser.add_argument("--max_steps",         type=int,   default=2_000)
+    parser.add_argument("--max_steps",         type=int,   default=2_500)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--eval_interval",     type=int,   default=200)
     args = parser.parse_args()

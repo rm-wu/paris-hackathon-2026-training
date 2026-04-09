@@ -1,6 +1,6 @@
-# Edouard's branch — v6 (val_loss 4.01 on 2 GPUs)
+# Edouard's branch — v7 (val_loss 3.92 on 2 GPUs)
 
-Best result so far: **val_loss 4.0127** in 9.1 min on 2x B300 GPUs (node 2, devices 6-7).
+Best result so far: **val_loss 3.9199** in 9.6 min on 2x B300 GPUs (node 2, devices 6-7).
 
 ## What changed vs baseline
 
@@ -40,7 +40,8 @@ Best result so far: **val_loss 4.0127** in 9.1 min on 2x B300 GPUs (node 2, devi
 | v3 (big model) | ~4.28 (train) | 1177 | ~450 | 253M params — too few steps, regression |
 | v4s (+ val eval) | 4.1689 (val) | 1669 | ~315 | 110M + val eval + WSD max_steps fix |
 | v5 (throughput) | 4.0939 (val) | 1964 | ~237 | + val_embed, x0, lambdas, throughput opts |
-| **v6 (this)** | **4.0127 (val)** | **2000** | **~220** | + ReLU², U-Net skips, zero-init |
+| v6 (new arch) | 4.0127 (val) | 2000 | ~220 | + ReLU², U-Net skips, zero-init |
+| **v7 (this)** | **3.9199 (val)** | **2500** | **~230** | max_steps 2000→2500, use full 10 min |
 
 ## How to run
 
@@ -58,7 +59,7 @@ torchrun --nproc_per_node=32 train.py \
     --time_limit_min 10
 ```
 
-## Next up (v7)
-- Increase max_steps from 2000 to 2500 (v6 finished in 9.1 min, 0.9 min wasted)
-- Explore FP8 training for 2x throughput on B300
-- Scale to 32 GPUs for final submission
+## Next up (v8/v9)
+- v8: max_steps=2700 (v7 finished in 9.6 min, still 0.4 min of margin)
+- v9: FP8 training via torchao (~1.3-2x matmul speedup on Blackwell)
+- Scale to 32 GPUs for final submission (bigger model, FSDP)
