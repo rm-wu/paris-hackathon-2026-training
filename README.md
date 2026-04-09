@@ -1,43 +1,61 @@
-# LLM Training Hackathon
+# Edouard's branch — v5 (val_loss 4.09 on 2 GPUs)
 
-## The Challenge
-Train the best language model you can in **10 minutes of GPU time** on a 32-GPU cluster.  
-Judged on **validation loss** (perplexity, lower is better). *(HellaSwag accuracy as tiebreaker.)*
+Best result so far: **val_loss 4.0939** in 10 min on 2x B300 GPUs (node 2, devices 6-7).
 
----
+## What changed vs baseline
 
-- Pre-tokenized `uint16` binary shards in `/home/data/chunk*` — vocab size **32,000**
+### Architecture (`model.py` — 119.6M params)
+| Technique | What it does |
+|-----------|-------------|
+| **SwiGLU** | LLaMA-style MLP, better loss/FLOP than GELU |
+| **RMSNorm** | Faster than LayerNorm (no mean computation) |
+| **RoPE** | Rotary Position Embeddings, replaces learned positional embeddings |
+| **QK Norm** | `rms_norm` on Q and K before attention — stabilizes gradients |
+| **Logit soft-capping** | `30 * tanh(logits/30)` prevents logit explosion (Gemma-style) |
+| **Norm after embedding** | `rms_norm` on token embeddings — stabilizes early layers |
+| **Value Embeddings** | Learned per-position bias on V in attention (ResFormer) |
+| **x0 Residual** | Skip from initial embedding to every block (learnable, init=0) |
+| **Per-layer Lambdas** | Learnable scaling for attn/mlp residuals per layer |
+| **Weight tying** | `wte.weight = lm_head.weight` |
 
-## What You Submit
-**Two Python files** (`model.py` and `train.py`) plus an optional `requirements.txt`.
+### Training (`train.py`)
+| Technique | What it does |
+|-----------|-------------|
+| **Muon optimizer** | Newton-Schulz orthogonalization for 2D weights (3 iters), AdamW for the rest |
+| **WSD schedule** | Warmup (100 steps) → Stable (80%) → Linear Decay (20%), for both AdamW and Muon |
+| **torch.compile** | Fused kernel generation |
+| **gc.disable()** | Eliminates ~100ms GC pauses during training |
+| **Batch 32, grad_accum 2** | Same tokens/step as 16/4, but 2x fewer micro-steps → faster steps |
+| **Data prefetch** | Async CPU data loading on a thread while GPU computes |
+| **Validation eval** | Last shard reserved for val, evaluated every 200 steps |
 
-- No embedded binary blobs or external assets
-- `requirements.txt` packages are installed before the clock starts
-- Any data preprocessing must happen within the training script
-- The 10-minute GPU clock starts from the **first forward pass**
+## Results on 2x B300
 
-We evaluate by running your `train.py` (which must produce `checkpoint.pt`), then loading it with your `model.py`:
-```python
-ckpt  = torch.load("checkpoint.pt", weights_only=True)
-model = get_model(ckpt["config"])   # from your model.py
-model.load_state_dict(ckpt["model"])
+| Version | val_loss | Steps | ms/step | Key change |
+|---------|----------|-------|---------|------------|
+| v1 (baseline+) | ~4.15 (train) | 1832 | ~300 | SwiGLU + RMSNorm + RoPE + Muon |
+| v2 (quick wins) | ~4.07 (train) | 1872 | ~250 | + QK Norm, logit cap, WSD, gc.disable |
+| v3 (big model) | ~4.28 (train) | 1177 | ~450 | 253M params — too few steps, regression |
+| v4s (+ val eval) | 4.1689 (val) | 1669 | ~315 | 110M + val eval + WSD max_steps fix |
+| **v5 (this)** | **4.0939 (val)** | **1964** | **~237** | + val_embed, x0, lambdas, throughput opts |
+
+## How to run
+
+```bash
+# On cluster (2 GPUs example)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 --master_port=29507 train.py \
+    --data_dir /home/data/ \
+    --checkpoint_path checkpoint.pt \
+    --time_limit_min 10
+
+# Full 32 GPUs (submission)
+torchrun --nproc_per_node=32 train.py \
+    --data_dir /home/data/ \
+    --checkpoint_path checkpoint.pt \
+    --time_limit_min 10
 ```
 
-`model.py` must expose `get_model(config: dict) -> nn.Module`. The `config` is whatever
-dict you saved — use it to store the hyperparameters needed to reconstruct your architecture.
-`forward` must be `(idx, targets=None) -> (logits, loss)`.
-
----
-
-## Rules
-- No external pretrained weights or training data
-- Everything else goes — custom kernels, custom optimizers, ensembles, multiple training runs, whatever
-- **10 minutes of GPU time**, counted from the first forward pass to last forward pass (i.e., finishing the step-inflight is fine (if this is a few seconds), staring a new one is not)
-- SLURM wall time is **12 minutes** to allow for NCCL init and checkpoint saving
-
----
-
-## Starter Code
-`model.py`, `train.py`, and `submit.sh` are provided as a working GPT baseline — DDP, bfloat16,
-cosine schedule, and the 10-minute timer built in. **You are free to ignore them entirely**
-and bring your own stack, as long as the checkpoint contract above is respected.
+## Next up (v6)
+- ReLU² MLP (2 matmuls vs 3, faster steps)
+- U-Net skip connections (layer 0→11, 1→10, ..., learned scalars)
+- Zero-init output projections (muP-like, faster convergence)

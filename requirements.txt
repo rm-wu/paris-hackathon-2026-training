@@ -1,0 +1,8 @@
+# Dépendances pour le hackathon LLM Training
+# Installées AVANT le chrono de 10 minutes — profites-en !
+#
+# torch et numpy sont déjà sur le cluster, pas besoin de les lister.
+#
+# À ajouter au fur et à mesure de nos améliorations :
+# triton          — pour les kernels fused (attention, cross-entropy)
+# wandb           — pour le monitoring (optionnel)
