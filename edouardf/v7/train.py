@@ -397,7 +397,7 @@ def main():
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+        if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:
                 tag = " ★ best!" if val < best_val else ""
@@ -409,10 +409,9 @@ def main():
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
 
-    if cfg.eval_interval > 0:
-        val = eval_loss(model, dataset, cfg, device, amp_ctx)
-        if master:
-            print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
+    val = eval_loss(model, dataset, cfg, device, amp_ctx)
+    if master:
+        print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
 
     gc.collect()
 

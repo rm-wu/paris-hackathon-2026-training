@@ -1,5 +1,5 @@
 """
-v6 training — ReLU² + U-Net skips + zero-init + throughput opts + val eval
+v5 training — optimized throughput + val eval + WSD for Muon
 """
 
 import gc
@@ -23,7 +23,7 @@ from model import get_model
 
 
 # ---------------------------------------------------------------------------
-# Muon optimizer — 3 Newton-Schulz iters
+# Muon optimizer — 3 Newton-Schulz iters (faster, ~same quality as 5)
 # ---------------------------------------------------------------------------
 
 class Muon(torch.optim.Optimizer):
@@ -91,7 +91,7 @@ class Config:
     muon_max_lr:      float = 0.02
     muon_min_lr:      float = 0.002
     warmup_steps:     int   = 100
-    max_steps:        int   = 2_500
+    max_steps:        int   = 2_000
     weight_decay:     float = 0.1
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
@@ -107,6 +107,9 @@ class Config:
 # ---------------------------------------------------------------------------
 
 class BinDataset:
+    """Memory-maps *.bin files. Last shard reserved for validation.
+    Supports async prefetch: call prefetch() to load next batch on CPU thread."""
+
     def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16"):
         paths = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
         if not paths:
@@ -159,6 +162,7 @@ class BinDataset:
         return x.to(device), y.to(device)
 
     def prefetch(self, batch_size: int):
+        """Start loading next train batch on a CPU thread."""
         def _load():
             self._prefetch_result = self._sample_batch_cpu(
                 self.train_shards, self.train_weights, batch_size)
@@ -240,7 +244,7 @@ def main():
     parser.add_argument("--n_embd",            type=int,   default=768)
     parser.add_argument("--batch_size",        type=int,   default=32)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
-    parser.add_argument("--max_steps",         type=int,   default=2_500)
+    parser.add_argument("--max_steps",         type=int,   default=2_000)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--eval_interval",     type=int,   default=200)
     args = parser.parse_args()
@@ -339,6 +343,7 @@ def main():
     for opt in optimizers:
         opt.zero_grad()
 
+    # Kick off first prefetch
     dataset.prefetch(cfg.batch_size)
 
     while step < cfg.max_steps:
@@ -355,6 +360,7 @@ def main():
 
         step_start = time.time()
 
+        # Update LR for both optimizers (WSD schedule)
         adam_lr = get_lr(step, cfg)
         muon_lr = get_muon_lr(step, cfg)
         for pg in optimizer_adam.param_groups:
@@ -362,9 +368,11 @@ def main():
         for pg in optimizer_muon.param_groups:
             pg["lr"] = muon_lr
 
+        # Gradient accumulation with prefetch
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
             x, y = dataset.get_batch(cfg.batch_size, device)
+            # Prefetch next batch while GPU works
             if micro_step < cfg.grad_accum_steps - 1:
                 dataset.prefetch(cfg.batch_size)
 
@@ -385,6 +393,7 @@ def main():
         step += 1
         loss_history.append(accumulated_loss)
 
+        # Prefetch for next step's first micro-batch
         dataset.prefetch(cfg.batch_size)
 
         if master and step % 10 == 0:
@@ -397,7 +406,8 @@ def main():
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+        # Validation eval — all processes must participate (DDP sync)
+        if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:
                 tag = " ★ best!" if val < best_val else ""
@@ -409,10 +419,9 @@ def main():
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
 
-    if cfg.eval_interval > 0:
-        val = eval_loss(model, dataset, cfg, device, amp_ctx)
-        if master:
-            print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
+    val = eval_loss(model, dataset, cfg, device, amp_ctx)
+    if master:
+        print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
 
     gc.collect()
 

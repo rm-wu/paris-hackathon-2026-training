@@ -1,5 +1,5 @@
 """
-v6 training — ReLU² + U-Net skips + zero-init + throughput opts + val eval
+v11 training — modded-nanogpt inspired: 50% cooldown, batch scheduling, auto grad_accum
 """
 
 import gc
@@ -85,16 +85,20 @@ class Config:
     dropout:    float = 0.0
 
     batch_size:       int   = 32
-    grad_accum_steps: int   = 2
+    grad_accum_steps: int   = 1
     max_lr:           float = 6e-4
-    min_lr:           float = 6e-5
+    min_lr_frac:      float = 0.15
     muon_max_lr:      float = 0.02
-    muon_min_lr:      float = 0.002
     warmup_steps:     int   = 100
     max_steps:        int   = 2_500
+    cooldown_frac:    float = 0.50
     weight_decay:     float = 0.1
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
+
+    # Batch scheduling: ramp batch_size from batch_size//2 to batch_size
+    # over the first 40% of training (modded-nanogpt style)
+    use_batch_schedule: bool = True
 
     eval_interval: int = 200
     eval_batches:  int = 10
@@ -171,27 +175,53 @@ class BinDataset:
 
 
 # ---------------------------------------------------------------------------
-# LR schedules: WSD for both AdamW and Muon
+# LR schedule: Warmup → Stable → Cooldown (50%)
+# Inspired by modded-nanogpt: longer cooldown = more convergence
 # ---------------------------------------------------------------------------
 
 def get_lr(step: int, cfg: Config) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * step / cfg.warmup_steps
-    decay_start = int(cfg.max_steps * 0.8)
-    if step < decay_start:
+    cooldown_start = int(cfg.max_steps * (1.0 - cfg.cooldown_frac))
+    if step < cooldown_start:
         return cfg.max_lr
-    progress = (step - decay_start) / (cfg.max_steps - decay_start)
-    return cfg.min_lr + (1.0 - progress) * (cfg.max_lr - cfg.min_lr)
+    min_lr = cfg.max_lr * cfg.min_lr_frac
+    progress = (step - cooldown_start) / (cfg.max_steps - cooldown_start)
+    return min_lr + (1.0 - progress) * (cfg.max_lr - min_lr)
 
 
 def get_muon_lr(step: int, cfg: Config) -> float:
     if step < cfg.warmup_steps:
         return cfg.muon_max_lr * step / cfg.warmup_steps
-    decay_start = int(cfg.max_steps * 0.8)
-    if step < decay_start:
+    cooldown_start = int(cfg.max_steps * (1.0 - cfg.cooldown_frac))
+    if step < cooldown_start:
         return cfg.muon_max_lr
-    progress = (step - decay_start) / (cfg.max_steps - decay_start)
-    return cfg.muon_min_lr + (1.0 - progress) * (cfg.muon_max_lr - cfg.muon_min_lr)
+    muon_min = cfg.muon_max_lr * cfg.min_lr_frac
+    progress = (step - cooldown_start) / (cfg.max_steps - cooldown_start)
+    return muon_min + (1.0 - progress) * (cfg.muon_max_lr - muon_min)
+
+
+# ---------------------------------------------------------------------------
+# Batch schedule: ramp from batch_size//2 → batch_size over first 40% of steps
+# This lets the model see more diverse gradients early (small batch = noisy = good
+# for exploration) then switch to large batch for stable convergence.
+# LR scales with batch: (cur_batch/max_batch)^0.5 (modded-nanogpt rule)
+# ---------------------------------------------------------------------------
+
+def get_batch_size_for_step(step: int, cfg: Config) -> int:
+    if not cfg.use_batch_schedule:
+        return cfg.batch_size
+    ramp_end = int(cfg.max_steps * 0.4)
+    min_bs = max(cfg.batch_size // 2, 1)
+    if step >= ramp_end:
+        return cfg.batch_size
+    frac = step / ramp_end
+    return min_bs + int(frac * (cfg.batch_size - min_bs))
+
+
+def batch_lr_scale(cur_bs: int, max_bs: int) -> float:
+    """Scale LR proportionally to sqrt(batch_size) — modded-nanogpt rule."""
+    return (cur_bs / max_bs) ** 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +269,48 @@ def main():
     parser.add_argument("--n_head",            type=int,   default=12)
     parser.add_argument("--n_embd",            type=int,   default=768)
     parser.add_argument("--batch_size",        type=int,   default=32)
-    parser.add_argument("--grad_accum_steps",  type=int,   default=2)
+    parser.add_argument("--grad_accum_steps",  type=int,   default=-1,
+                        help="-1 = auto (8 // world_size)")
     parser.add_argument("--max_steps",         type=int,   default=2_500)
+    parser.add_argument("--max_lr",            type=float, default=6e-4)
+    parser.add_argument("--muon_max_lr",       type=float, default=0.02)
+    parser.add_argument("--warmup_steps",      type=int,   default=100)
+    parser.add_argument("--cooldown_frac",     type=float, default=0.50)
+    parser.add_argument("--no_batch_schedule", action="store_true")
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--eval_interval",     type=int,   default=200)
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------ DDP
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        init_process_group(backend="nccl")
+        rank       = dist.get_rank()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = dist.get_world_size()
+        device     = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+        master     = rank == 0
+    else:
+        rank = 0; master = True; world_size = 1
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+    # Auto grad_accum: keep effective batch ≈ constant across GPU counts
+    # 8 GPUs → accum=1, 4 → 2, 2 → 4, 1 → 8 (modded-nanogpt rule)
+    if args.grad_accum_steps == -1:
+        grad_accum = max(1, 8 // world_size)
+        if master:
+            print(f"[auto] grad_accum_steps = {grad_accum} (8 // {world_size} GPUs)")
+    else:
+        grad_accum = args.grad_accum_steps
+
+    torch.manual_seed(1337 + rank)
+    gc.disable()
 
     cfg = Config(
         data_dir           = args.data_dir,
@@ -254,32 +321,23 @@ def main():
         n_head             = args.n_head,
         n_embd             = args.n_embd,
         batch_size         = args.batch_size,
-        grad_accum_steps   = args.grad_accum_steps,
+        grad_accum_steps   = grad_accum,
         max_steps          = args.max_steps,
+        max_lr             = args.max_lr,
+        muon_max_lr        = args.muon_max_lr,
+        warmup_steps       = args.warmup_steps,
+        cooldown_frac      = args.cooldown_frac,
+        use_batch_schedule = not args.no_batch_schedule,
         time_limit_seconds = args.time_limit_min * 60,
         eval_interval      = args.eval_interval,
     )
 
-    # ------------------------------------------------------------------ DDP
-    ddp = int(os.environ.get("RANK", -1)) != -1
-    if ddp:
-        init_process_group(backend="nccl")
-        rank       = dist.get_rank()
-        local_rank = int(os.environ["LOCAL_RANK"])
-        device     = f"cuda:{local_rank}"
-        torch.cuda.set_device(device)
-        master     = rank == 0
-    else:
-        rank = 0; master = True
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
-    torch.manual_seed(1337 + rank)
-    gc.disable()
+    if master:
+        eff_batch = cfg.batch_size * cfg.grad_accum_steps * world_size
+        cooldown_start = int(cfg.max_steps * (1.0 - cfg.cooldown_frac))
+        print(f"[cfg] effective_batch={eff_batch} seqs ({eff_batch*cfg.seq_len//1024}K tokens/step)")
+        print(f"[cfg] cooldown at step {cooldown_start} ({cfg.cooldown_frac*100:.0f}% of {cfg.max_steps})")
+        print(f"[cfg] batch_schedule={'ON' if cfg.use_batch_schedule else 'OFF'}")
 
     if "cuda" in device:
         amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -339,7 +397,8 @@ def main():
     for opt in optimizers:
         opt.zero_grad()
 
-    dataset.prefetch(cfg.batch_size)
+    cur_bs = get_batch_size_for_step(0, cfg)
+    dataset.prefetch(cur_bs)
 
     while step < cfg.max_steps:
 
@@ -355,8 +414,12 @@ def main():
 
         step_start = time.time()
 
-        adam_lr = get_lr(step, cfg)
-        muon_lr = get_muon_lr(step, cfg)
+        # Batch scheduling
+        cur_bs = get_batch_size_for_step(step, cfg)
+        bs_scale = batch_lr_scale(cur_bs, cfg.batch_size)
+
+        adam_lr = get_lr(step, cfg) * bs_scale
+        muon_lr = get_muon_lr(step, cfg) * bs_scale
         for pg in optimizer_adam.param_groups:
             pg["lr"] = adam_lr
         for pg in optimizer_muon.param_groups:
@@ -364,9 +427,9 @@ def main():
 
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
-            x, y = dataset.get_batch(cfg.batch_size, device)
+            x, y = dataset.get_batch(cur_bs, device)
             if micro_step < cfg.grad_accum_steps - 1:
-                dataset.prefetch(cfg.batch_size)
+                dataset.prefetch(cur_bs)
 
             sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
@@ -385,14 +448,14 @@ def main():
         step += 1
         loss_history.append(accumulated_loss)
 
-        dataset.prefetch(cfg.batch_size)
+        dataset.prefetch(cur_bs)
 
         if master and step % 10 == 0:
             elapsed_total = time.time() - train_start
             remaining     = max(0, cfg.time_limit_seconds - elapsed_total)
             avg50 = sum(loss_history) / len(loss_history)
             print(f"step {step:6d} | loss {accumulated_loss:.4f} | avg50 {avg50:.4f} | "
-                  f"lr {adam_lr:.2e} | μlr {muon_lr:.3f} | "
+                  f"lr {adam_lr:.2e} | μlr {muon_lr:.3f} | bs {cur_bs} | "
                   f"{(time.time()-step_start)*1000:.0f}ms/step | "
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")

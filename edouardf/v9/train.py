@@ -1,5 +1,5 @@
 """
-v6 training — ReLU² + U-Net skips + zero-init + throughput opts + val eval
+v9 training — v7 base (max_steps=2500) + FP8 training via torchao (Blackwell B300)
 """
 
 import gc
@@ -294,6 +294,19 @@ def main():
         n_params = sum(p.numel() for p in model.parameters())
         print(f"[model] {n_params/1e6:.1f}M parameters")
 
+    # ------------------------------------------------------------------ FP8
+    use_fp8 = False
+    if "cuda" in device:
+        try:
+            from torchao.float8 import convert_to_float8_training
+            convert_to_float8_training(model)
+            use_fp8 = True
+            if master:
+                print("[fp8] torchao float8 training enabled")
+        except (ImportError, Exception) as e:
+            if master:
+                print(f"[fp8] not available ({e}), using bf16")
+
     if "cuda" in device and hasattr(torch, "compile"):
         model = torch.compile(model)
         if master:
@@ -397,7 +410,7 @@ def main():
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+        if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:
                 tag = " ★ best!" if val < best_val else ""
@@ -409,10 +422,9 @@ def main():
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
 
-    if cfg.eval_interval > 0:
-        val = eval_loss(model, dataset, cfg, device, amp_ctx)
-        if master:
-            print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
+    val = eval_loss(model, dataset, cfg, device, amp_ctx)
+    if master:
+        print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
 
     gc.collect()
 

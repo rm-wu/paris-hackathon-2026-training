@@ -91,7 +91,7 @@ class Config:
     muon_max_lr:      float = 0.02
     muon_min_lr:      float = 0.002
     warmup_steps:     int   = 100
-    max_steps:        int   = 2_500
+    max_steps:        int   = 2_700
     weight_decay:     float = 0.1
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
@@ -240,7 +240,7 @@ def main():
     parser.add_argument("--n_embd",            type=int,   default=768)
     parser.add_argument("--batch_size",        type=int,   default=32)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
-    parser.add_argument("--max_steps",         type=int,   default=2_500)
+    parser.add_argument("--max_steps",         type=int,   default=2_700)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--eval_interval",     type=int,   default=200)
     args = parser.parse_args()
@@ -397,7 +397,7 @@ def main():
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+        if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:
                 tag = " ★ best!" if val < best_val else ""
@@ -409,10 +409,9 @@ def main():
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
 
-    if cfg.eval_interval > 0:
-        val = eval_loss(model, dataset, cfg, device, amp_ctx)
-        if master:
-            print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
+    val = eval_loss(model, dataset, cfg, device, amp_ctx)
+    if master:
+        print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
 
     gc.collect()
 

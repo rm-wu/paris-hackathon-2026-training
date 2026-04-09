@@ -1,5 +1,5 @@
 """
-v6 training — ReLU² + U-Net skips + zero-init + throughput opts + val eval
+v4s training script — v2 base + fused CE + validation eval
 """
 
 import gc
@@ -8,7 +8,6 @@ import time
 import glob
 import math
 import argparse
-import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 from collections import deque
@@ -23,7 +22,7 @@ from model import get_model
 
 
 # ---------------------------------------------------------------------------
-# Muon optimizer — 3 Newton-Schulz iters
+# Muon optimizer
 # ---------------------------------------------------------------------------
 
 class Muon(torch.optim.Optimizer):
@@ -51,7 +50,7 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr)
 
     @staticmethod
-    def _newton_schulz(G, steps=3):
+    def _newton_schulz(G, steps=5):
         a, b, c = (3.4445, -4.7750, 2.0315)
         shape = G.shape
         if G.shape[0] > G.shape[1]:
@@ -59,7 +58,8 @@ class Muon(torch.optim.Optimizer):
             transposed = True
         else:
             transposed = False
-        G = G / (G.norm() + 1e-7)
+        eps = 1e-7
+        G = G / (G.norm() + eps)
         for _ in range(steps):
             A = G @ G.T
             G = a * G + b * (A @ G) + c * (A @ (A @ G))
@@ -84,14 +84,12 @@ class Config:
     n_embd:     int   = 768
     dropout:    float = 0.0
 
-    batch_size:       int   = 32
-    grad_accum_steps: int   = 2
+    batch_size:       int   = 16
+    grad_accum_steps: int   = 4
     max_lr:           float = 6e-4
     min_lr:           float = 6e-5
-    muon_max_lr:      float = 0.02
-    muon_min_lr:      float = 0.002
     warmup_steps:     int   = 100
-    max_steps:        int   = 2_500
+    max_steps:        int   = 2_000
     weight_decay:     float = 0.1
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
@@ -103,10 +101,12 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# Dataset with prefetch
+# Dataset — with separate train/val splits
 # ---------------------------------------------------------------------------
 
 class BinDataset:
+    """Memory-maps *.bin files. Last shard reserved for validation."""
+
     def __init__(self, data_dir: str, seq_len: int, dtype: str = "uint16"):
         paths = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
         if not paths:
@@ -132,13 +132,10 @@ class BinDataset:
         self.val_total = sum(val_lens)
         self.val_weights = [l / self.val_total for l in val_lens]
 
-        self._prefetch_result = None
-        self._prefetch_thread = None
-
         print(f"[data] train: {len(train_paths)} shard(s), {self.train_total:,} tokens")
         print(f"[data] val:   {len(val_paths)} shard(s), {self.val_total:,} tokens")
 
-    def _sample_batch_cpu(self, shards, weights, batch_size):
+    def _sample_batch(self, shards, weights, batch_size, device):
         xs, ys = [], []
         for _ in range(batch_size):
             shard = shards[np.random.choice(len(shards), p=weights)]
@@ -146,32 +143,17 @@ class BinDataset:
             chunk = torch.from_numpy(shard[start:start + self.seq_len + 1].astype(np.int64))
             xs.append(chunk[:-1])
             ys.append(chunk[1:])
-        return torch.stack(xs), torch.stack(ys)
+        return torch.stack(xs).to(device), torch.stack(ys).to(device)
 
     def get_batch(self, batch_size: int, device):
-        if self._prefetch_result is not None and self._prefetch_thread is not None:
-            self._prefetch_thread.join()
-            x, y = self._prefetch_result
-            self._prefetch_result = None
-            self._prefetch_thread = None
-            return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        x, y = self._sample_batch_cpu(self.train_shards, self.train_weights, batch_size)
-        return x.to(device), y.to(device)
-
-    def prefetch(self, batch_size: int):
-        def _load():
-            self._prefetch_result = self._sample_batch_cpu(
-                self.train_shards, self.train_weights, batch_size)
-        self._prefetch_thread = threading.Thread(target=_load)
-        self._prefetch_thread.start()
+        return self._sample_batch(self.train_shards, self.train_weights, batch_size, device)
 
     def get_val_batch(self, batch_size: int, device):
-        x, y = self._sample_batch_cpu(self.val_shards, self.val_weights, batch_size)
-        return x.to(device), y.to(device)
+        return self._sample_batch(self.val_shards, self.val_weights, batch_size, device)
 
 
 # ---------------------------------------------------------------------------
-# LR schedules: WSD for both AdamW and Muon
+# LR schedule: WSD (Warmup-Stable-Decay)
 # ---------------------------------------------------------------------------
 
 def get_lr(step: int, cfg: Config) -> float:
@@ -182,16 +164,6 @@ def get_lr(step: int, cfg: Config) -> float:
         return cfg.max_lr
     progress = (step - decay_start) / (cfg.max_steps - decay_start)
     return cfg.min_lr + (1.0 - progress) * (cfg.max_lr - cfg.min_lr)
-
-
-def get_muon_lr(step: int, cfg: Config) -> float:
-    if step < cfg.warmup_steps:
-        return cfg.muon_max_lr * step / cfg.warmup_steps
-    decay_start = int(cfg.max_steps * 0.8)
-    if step < decay_start:
-        return cfg.muon_max_lr
-    progress = (step - decay_start) / (cfg.max_steps - decay_start)
-    return cfg.muon_min_lr + (1.0 - progress) * (cfg.muon_max_lr - cfg.muon_min_lr)
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +210,9 @@ def main():
     parser.add_argument("--n_layer",           type=int,   default=12)
     parser.add_argument("--n_head",            type=int,   default=12)
     parser.add_argument("--n_embd",            type=int,   default=768)
-    parser.add_argument("--batch_size",        type=int,   default=32)
-    parser.add_argument("--grad_accum_steps",  type=int,   default=2)
-    parser.add_argument("--max_steps",         type=int,   default=2_500)
+    parser.add_argument("--batch_size",        type=int,   default=16)
+    parser.add_argument("--grad_accum_steps",  type=int,   default=4)
+    parser.add_argument("--max_steps",         type=int,   default=2_000)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
     parser.add_argument("--eval_interval",     type=int,   default=200)
     args = parser.parse_args()
@@ -299,6 +271,7 @@ def main():
         if master:
             print("[compile] torch.compile enabled")
 
+
     if ddp:
         model = DDP(model, device_ids=[local_rank])
 
@@ -314,7 +287,7 @@ def main():
             continue
         if p.dim() < 2:
             adam_params_nodecay.append(p)
-        elif "wte" in name or "lm_head" in name or "val_embed" in name:
+        elif "wte" in name or "lm_head" in name:
             adam_params_decay.append(p)
         else:
             muon_params.append(p)
@@ -324,7 +297,7 @@ def main():
          {"params": adam_params_nodecay, "weight_decay": 0.0}],
         lr=cfg.max_lr, betas=(0.9, 0.95), fused=("cuda" in device),
     )
-    optimizer_muon = Muon(muon_params, lr=cfg.muon_max_lr, momentum=0.95)
+    optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
     optimizers = [optimizer_adam, optimizer_muon]
 
     # ------------------------------------------------------------------ Data
@@ -339,8 +312,6 @@ def main():
     for opt in optimizers:
         opt.zero_grad()
 
-    dataset.prefetch(cfg.batch_size)
-
     while step < cfg.max_steps:
 
         elapsed = time.time() - train_start
@@ -354,20 +325,12 @@ def main():
             break
 
         step_start = time.time()
-
-        adam_lr = get_lr(step, cfg)
-        muon_lr = get_muon_lr(step, cfg)
         for pg in optimizer_adam.param_groups:
-            pg["lr"] = adam_lr
-        for pg in optimizer_muon.param_groups:
-            pg["lr"] = muon_lr
+            pg["lr"] = get_lr(step, cfg)
 
         accumulated_loss = 0.0
         for micro_step in range(cfg.grad_accum_steps):
-            x, y = dataset.get_batch(cfg.batch_size, device)
-            if micro_step < cfg.grad_accum_steps - 1:
-                dataset.prefetch(cfg.batch_size)
-
+            x, y     = dataset.get_batch(cfg.batch_size, device)
             sync_ctx = model.no_sync() if (ddp and micro_step < cfg.grad_accum_steps - 1) \
                        else nullcontext()
             with sync_ctx, amp_ctx:
@@ -385,19 +348,18 @@ def main():
         step += 1
         loss_history.append(accumulated_loss)
 
-        dataset.prefetch(cfg.batch_size)
-
         if master and step % 10 == 0:
             elapsed_total = time.time() - train_start
             remaining     = max(0, cfg.time_limit_seconds - elapsed_total)
             avg50 = sum(loss_history) / len(loss_history)
             print(f"step {step:6d} | loss {accumulated_loss:.4f} | avg50 {avg50:.4f} | "
-                  f"lr {adam_lr:.2e} | μlr {muon_lr:.3f} | "
+                  f"lr {get_lr(step, cfg):.2e} | "
                   f"{(time.time()-step_start)*1000:.0f}ms/step | "
                   f"elapsed {elapsed_total/60:.1f}m | "
                   f"time left {remaining/60:.1f}m")
 
-        if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+        # Validation eval — all processes must participate (DDP sync)
+        if step % cfg.eval_interval == 0:
             val = eval_loss(model, dataset, cfg, device, amp_ctx)
             if master:
                 tag = " ★ best!" if val < best_val else ""
@@ -409,10 +371,9 @@ def main():
         print(f"\n[done] Reached max_steps={cfg.max_steps}.")
         save_checkpoint(model, step, cfg)
 
-    if cfg.eval_interval > 0:
-        val = eval_loss(model, dataset, cfg, device, amp_ctx)
-        if master:
-            print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
+    val = eval_loss(model, dataset, cfg, device, amp_ctx)
+    if master:
+        print(f"[eval] FINAL | val_loss {val:.4f} | best was {best_val:.4f}")
 
     gc.collect()
 
